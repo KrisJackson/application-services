@@ -6,6 +6,7 @@ use crate::error::*;
 use rusqlite::{Connection, OpenFlags, Transaction, NO_PARAMS};
 use serde_json::{Map, Value};
 use sql_support::ConnExt;
+use std::convert::TryInto;
 use std::path::Path;
 
 // Simple migration from the "old" kinto-with-sqlite-backing implementation
@@ -107,29 +108,42 @@ struct Parsed<'a> {
     data: serde_json::Value,
 }
 
-pub fn migrate(tx: &Transaction<'_>, filename: &Path) -> Result<usize> {
+pub fn migrate(tx: &Transaction<'_>, filename: &Path) -> Result<MigrationInfo> {
     // We do the grouping manually, collecting string values as we go.
     let mut last_ext_id = "".to_string();
     let mut curr_values: Vec<(String, serde_json::Value)> = Vec::new();
-    let mut num_extensions = 0;
-    for row in read_rows(filename) {
+    let mut curr_quota_bytes: usize = 0;
+    let (rows, mut mi) = read_rows(filename);
+    for row in rows {
         log::trace!("processing '{}' - '{}'", row.col_name, row.record);
         let parsed = match row.parse() {
             Some(p) => p,
-            None => continue,
+            None => {
+                mi.non_fatal_errors_seen += 1;
+                continue;
+            }
         };
         // Do our "grouping"
         if parsed.ext_id != last_ext_id {
             if last_ext_id != "" && !curr_values.is_empty() {
                 // a different extension id - write what we have to the DB.
-                do_insert(tx, &last_ext_id, curr_values)?;
-                num_extensions += 1;
+                let entries = do_insert(tx, &last_ext_id, curr_values)?;
+                mi.extensions_successful += 1;
+                mi.entries_successful += entries;
             }
             last_ext_id = parsed.ext_id.to_string();
             curr_values = Vec::new();
+            curr_quota_bytes = 0;
         }
         // no 'else' here - must also enter this block on ext_id change.
         if parsed.ext_id == last_ext_id {
+            let quota_bytes = crate::api::get_quota_size_of(&parsed.key, &parsed.data);
+            curr_quota_bytes += quota_bytes;
+            if quota_bytes > crate::api::SYNC_QUOTA_BYTES_PER_ITEM
+                || curr_quota_bytes > crate::api::SYNC_QUOTA_BYTES
+            {
+                mi.overflowed_quotas = true;
+            }
             curr_values.push((parsed.key.to_string(), parsed.data));
             log::trace!(
                 "extension {} now has {} keys",
@@ -141,32 +155,52 @@ pub fn migrate(tx: &Transaction<'_>, filename: &Path) -> Result<usize> {
     // and the last one
     if last_ext_id != "" && !curr_values.is_empty() {
         // a different extension id - write what we have to the DB.
-        do_insert(tx, &last_ext_id, curr_values)?;
-        num_extensions += 1;
+        let entries = do_insert(tx, &last_ext_id, curr_values)?;
+        mi.extensions_successful += 1;
+        mi.entries_successful += entries;
     }
-    log::info!("migrated {} extensions", num_extensions);
-    Ok(num_extensions)
+    log::info!("migrated {} extensions: {:?}", mi.extensions_successful, mi);
+    Ok(mi)
 }
 
-fn read_rows(filename: &Path) -> Vec<LegacyRow> {
+fn read_rows(filename: &Path) -> (Vec<LegacyRow>, MigrationInfo) {
     let flags = OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_READ_ONLY;
     let src_conn = match Connection::open_with_flags(&filename, flags) {
         Ok(conn) => conn,
         Err(e) => {
             log::warn!("Failed to open the source DB: {}", e);
-            return Vec::new();
+            return (
+                Vec::new(),
+                MigrationInfo {
+                    non_fatal_errors_seen: 1,
+                    open_failure: true,
+                    ..Default::default()
+                },
+            );
         }
     };
     // Failure to prepare the statement probably just means the source DB is
     // damaged.
     let mut stmt = match src_conn.prepare(
         "SELECT collection_name, record FROM collection_data
+         WHERE collection_name != 'default/storage-sync-crypto'
          ORDER BY collection_name",
     ) {
         Ok(stmt) => stmt,
         Err(e) => {
             log::warn!("Failed to prepare the statement: {}", e);
-            return Vec::new();
+            return (
+                Vec::new(),
+                MigrationInfo {
+                    non_fatal_errors_seen: 1,
+                    // I believe the only case where this would happen is if (we
+                    // have a bug or) the source database has a corrupted
+                    // schema. It doesn't really seem worth distinguishing that
+                    // from "complete read failure" cases, so here we are.
+                    open_failure: true,
+                    ..Default::default()
+                },
+            );
         }
     };
     let rows = match stmt.query_and_then(NO_PARAMS, |row| -> Result<LegacyRow> {
@@ -178,18 +212,72 @@ fn read_rows(filename: &Path) -> Vec<LegacyRow> {
         Ok(r) => r,
         Err(e) => {
             log::warn!("Failed to read any rows from the source DB: {}", e);
-            return Vec::new();
+            return (
+                Vec::new(),
+                MigrationInfo {
+                    non_fatal_errors_seen: 1,
+                    open_failure: true,
+                    ..Default::default()
+                },
+            );
         }
     };
+    let rows: Vec<LegacyRow> = rows.filter_map(Result::ok).collect();
 
-    rows.filter_map(Result::ok).collect()
+    let entries = src_conn.query_row::<i64, _, _>(
+        "SELECT COUNT(*) FROM collection_data
+            WHERE collection_name != 'default/storage-sync-crypto'",
+        NO_PARAMS,
+        |r| r.get(0),
+    );
+    let entries_is_err = entries.is_err();
+    let entries: usize = entries.unwrap_or_default().try_into().unwrap_or_default();
+
+    let extensions = src_conn.query_row::<i64, _, _>(
+        "SELECT COUNT(DISTINCT collection_name) FROM collection_data
+            WHERE collection_name != 'default/storage-sync-crypto'",
+        NO_PARAMS,
+        |r| r.get(0),
+    );
+
+    let extensions_is_err = extensions.is_err();
+    let extensions: usize = extensions
+        .unwrap_or_default()
+        .try_into()
+        .unwrap_or_default();
+
+    // If rows.len() > entries it means we saw an error in the COUNT call (or
+    // something is very weird), but this would be caught by `entries_is_err`.
+    let entries_failed = entries.saturating_sub(rows.len());
+
+    let non_fatal_errors_seen =
+        entries_failed + (extensions_is_err as usize) + (entries_is_err as usize);
+
+    let mi = MigrationInfo {
+        entries,
+        extensions,
+        non_fatal_errors_seen,
+        // Populated later.
+        extensions_successful: 0,
+        entries_successful: 0,
+        overflowed_quotas: false,
+        open_failure: false,
+    };
+
+    (rows, mi)
 }
 
-fn do_insert(tx: &Transaction<'_>, ext_id: &str, vals: Vec<(String, Value)>) -> Result<()> {
+/// Insert the extension and values. If there are multiple values with the same
+/// key (which shouldn't be possible but who knows, database corruption causes
+/// strange things), chooses an arbitrary one. Returns the number of entries
+/// inserted, which could be different from `vals.len()` if multiple entries in
+/// `vals` have the same key.
+fn do_insert(tx: &Transaction<'_>, ext_id: &str, vals: Vec<(String, Value)>) -> Result<usize> {
     let mut map = Map::with_capacity(vals.len());
     for (key, val) in vals {
         map.insert(key, val);
     }
+    let num_entries = map.len();
     tx.execute_named_cached(
         "INSERT OR REPLACE INTO storage_sync_data(ext_id, data, sync_change_counter)
          VALUES (:ext_id, :data, 1)",
@@ -198,7 +286,30 @@ fn do_insert(tx: &Transaction<'_>, ext_id: &str, vals: Vec<(String, Value)>) -> 
             ":data": &Value::Object(map),
         },
     )?;
-    Ok(())
+    Ok(num_entries)
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MigrationInfo {
+    /// The number of entries (rows in the original table) we attempted to
+    /// migrate. Zero if there was some error in computing this number.
+    pub entries: usize,
+    /// The number of records we successfully migrated (equal to `entries` for
+    /// entirely successful migrations).
+    pub entries_successful: usize,
+    /// The number of extensions (distinct extension ids) in the original
+    /// table.
+    pub extensions: usize,
+    /// The number of extensions we successfully migrated
+    pub extensions_successful: usize,
+    /// A count of recoverable non-fatal errors seen. Generally this will cause
+    /// the failed count to be nonzero, but there are other cases that can cause
+    /// error (failing to compute # of entries or extensions).
+    pub non_fatal_errors_seen: usize,
+    /// True if we hit at least one quota error.
+    pub overflowed_quotas: bool,
+    /// True iff we failed to open the source DB at all.
+    pub open_failure: bool,
 }
 
 #[cfg(test)]
@@ -211,7 +322,7 @@ mod tests {
 
     // Create a test database, populate it via the callback, migrate it, and
     // return a connection to the new, migrated DB for further checking.
-    fn do_migrate<F>(num_expected: usize, f: F) -> StorageDb
+    fn do_migrate<F>(expect_mi: MigrationInfo, f: F) -> StorageDb
     where
         F: FnOnce(&Connection),
     {
@@ -238,9 +349,9 @@ mod tests {
         let mut db = new_mem_db();
         let tx = db.transaction().expect("tx should work");
 
-        let num = migrate(&tx, &tmpdir.path().join("source.db")).expect("migrate should work");
+        let mi = migrate(&tx, &tmpdir.path().join("source.db")).expect("migrate should work");
         tx.commit().expect("should work");
-        assert_eq!(num, num_expected);
+        assert_eq!(mi, expect_mi);
         db
     }
 
@@ -255,8 +366,18 @@ mod tests {
     #[test]
     fn test_happy_paths() {
         // some real data.
-        let conn = do_migrate(2, |c| {
-            c.execute_batch(
+        let conn = do_migrate(
+            MigrationInfo {
+                entries: 5,
+                entries_successful: 5,
+                extensions: 2,
+                extensions_successful: 2,
+                non_fatal_errors_seen: 0,
+                overflowed_quotas: false,
+                open_failure: false,
+            },
+            |c| {
+                c.execute_batch(
                 r#"INSERT INTO collection_data(collection_name, record)
                     VALUES
                     ('default/{e7fefcf3-b39c-4f17-5215-ebfe120a7031}', '{"id":"key-userWelcomed","key":"userWelcomed","data":1570659224457,"_status":"synced","last_modified":1579755940527}'),
@@ -267,7 +388,8 @@ mod tests {
                     ('default/https-everywhere@eff.org', '{"id":"key-migration_5F_version","key":"migration_version","data":2,"_status":"synced","last_modified":1570079919966}')
                     "#,
             ).expect("should popuplate")
-        });
+            },
+        );
 
         assert_has(
             &conn,
@@ -283,9 +405,19 @@ mod tests {
 
     #[test]
     fn test_sad_paths() {
-        do_migrate(0, |c| {
-            c.execute_batch(
-                r#"INSERT INTO collection_data(collection_name, record)
+        do_migrate(
+            MigrationInfo {
+                entries: 10,
+                entries_successful: 0,
+                extensions: 6,
+                extensions_successful: 0,
+                non_fatal_errors_seen: 9,
+                overflowed_quotas: false,
+                open_failure: false,
+            },
+            |c| {
+                c.execute_batch(
+                    r#"INSERT INTO collection_data(collection_name, record)
                     VALUES
                     ('default/test', '{"key":2,"data":1}'), -- key not a string
                     ('default/test', '{"key":"","data":1}'), -- key empty string
@@ -298,8 +430,9 @@ mod tests {
                     ('defaultx/test', '{"key":"k","data":1}'), -- bad key format 4
                     ('', '') -- empty strings
                     "#,
-            )
-            .expect("should populate");
-        });
+                )
+                .expect("should populate");
+            },
+        );
     }
 }

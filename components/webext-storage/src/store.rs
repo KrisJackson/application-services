@@ -119,10 +119,11 @@ impl Store {
     }
 
     /// Migrates data from a database in the format of the "old" kinto
-    /// implementation. Returns the count of webextensions for whom data was
-    /// migrated.
+    /// implementation. Returns a MigrationInfo describing what happened, for
+    /// telemetry.
+    ///
     /// Note that `filename` isn't normalized or canonicalized.
-    pub fn migrate(&self, filename: impl AsRef<Path>) -> Result<usize> {
+    pub fn migrate(&self, filename: impl AsRef<Path>) -> Result<crate::MigrationInfo> {
         let tx = self.db.unchecked_transaction()?;
         let result = migrate(&tx, filename.as_ref())?;
         tx.commit()?;
